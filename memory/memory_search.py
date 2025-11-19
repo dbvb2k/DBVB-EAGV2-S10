@@ -75,7 +75,10 @@ class MemorySearch:
                         pass
                     
                     async with aiofiles.open(file, 'r', encoding='utf-8') as f:
-                        content_str = await f.read().strip()
+                        content_str = await f.read()
+                    
+                    # Strip whitespace after reading
+                    content_str = content_str.strip()
                     
                     # Check if content is empty after reading
                     if not content_str:
