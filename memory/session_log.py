@@ -3,8 +3,17 @@ import asyncio
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
+from decimal import Decimal
 import aiofiles
 import aiofiles.os
+
+
+class DecimalEncoder(json.JSONEncoder):
+    """Custom JSON encoder that handles Decimal types."""
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return str(obj)
+        return super().default(obj)
 
 
 async def get_store_path(session_id: str, base_dir: str = "memory/session_logs") -> Path:
@@ -77,7 +86,7 @@ async def append_session_to_store(session_obj, base_dir: str = "memory/session_l
     # Write session data
     try:
         async with aiofiles.open(store_path, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(session_data, indent=2))
+            await f.write(json.dumps(session_data, indent=2, cls=DecimalEncoder))
         print(f"✅ Session stored: {store_path}")
     except Exception as e:
         print(f"❌ Failed to write session to {store_path}: {e}")

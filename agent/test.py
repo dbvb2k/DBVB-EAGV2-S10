@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from agentSession import AgentSession, Step, ToolCode, PerceptionSnapshot
+from agent.agentSession import AgentSession, Step, ToolCode, PerceptionSnapshot, StepType, StepStatus
 
 # Load JSON results
 perception_data = json.loads(Path("perception_results.json").read_text())
@@ -24,12 +24,12 @@ step0 = Step(
     code=ToolCode(
                 tool_name=step0_def["tool_name"],
                 tool_arguments=step0_def["tool_arguments"]
-                ) if step0_def["type"] == "CODE" else None
+                ) if step0_def.get("type", "").upper() == "CODE" else None,
+    attempts=1,
+    status=StepStatus.FAILED,
+    error="Failed or timeout",
+    perception=PerceptionSnapshot(**perception_data["steps"]["0"])
 )
-step0.attempts = 1
-step0.execution_result, step0.error = None, "Failed or timeout"
-step0.perception = PerceptionSnapshot(**perception_data["steps"]["0"])
-step0.status = "failed"
 steps_v1.append(step0)
 session.add_plan_version(plan_text_v1, steps_v1)
 
@@ -44,12 +44,12 @@ step1 = Step(
     code=ToolCode(
                     tool_name=step1_def["tool_name"],
                     tool_arguments=step1_def["tool_arguments"]
-                ) if step1_def["type"] == "CODE" else None if step1_def["type"] == "CODE" else None
+                ) if step1_def.get("type", "").upper() == "CODE" else None,
+    attempts=1,
+    status=StepStatus.FAILED,
+    error="Failed or timeout",
+    perception=PerceptionSnapshot(**perception_data["steps"]["1"])
 )
-step1.attempts = 1
-step1.execution_result, step1.error = None, "Failed or timeout"
-step1.perception = PerceptionSnapshot(**perception_data["steps"]["1"])
-step1.status = "failed"
 steps_v2.append(step1)
 session.add_plan_version(plan_text_v2, steps_v2)
 
@@ -64,12 +64,12 @@ step2 = Step(
     code=ToolCode(
             tool_name=step2_def["tool_name"],
             tool_arguments=step2_def["tool_arguments"]
-        ) if step2_def["type"] == "CODE" else None if step2_def["type"] == "CODE" else None
+        ) if step2_def.get("type", "").upper() == "CODE" else None,
+    attempts=1,
+    execution_result="Found 3BHK, 4BHK, and 5BHK as official variants",
+    perception=PerceptionSnapshot(**perception_data["steps"]["2"]),
+    status=StepStatus.COMPLETED
 )
-step2.attempts = 1
-step2.execution_result, step2.error = "Found 3BHK, 4BHK, and 5BHK as official variants", None
-step2.perception = PerceptionSnapshot(**perception_data["steps"]["2"])
-step2.status = "completed"
 steps_v3.append(step2)
 session.add_plan_version(plan_text_v3, steps_v3)
 
@@ -82,15 +82,18 @@ step3 = Step(
     description=step3_def["description"],
     type=step3_def["type"],
     conclusion="DLF Camelia has 3BHK, 4BHK, and 5BHK variants available.",
-    status="completed"
-)
-step3.perception = PerceptionSnapshot(
-    entities=["3BHK", "4BHK", "5BHK"],
-    result_requirement="Final answer with all variants",
-    original_goal_achieved=True,
-    reasoning="Matches query perfectly.",
-    local_goal_achieved=True,
-    local_reasoning="All objectives clearly met."
+    status=StepStatus.COMPLETED,
+    perception=PerceptionSnapshot(
+        entities=["3BHK", "4BHK", "5BHK"],
+        result_requirement="Final answer with all variants",
+        original_goal_achieved=True,
+        reasoning="Matches query perfectly.",
+        local_goal_achieved=True,
+        local_reasoning="All objectives clearly met.",
+        last_tooluse_summary="",
+        solution_summary="DLF Camelia has 3BHK, 4BHK, and 5BHK variants available.",
+        confidence="0.95"
+    )
 )
 steps_v4.append(step3)
 session.add_plan_version(plan_text_v4, steps_v4)

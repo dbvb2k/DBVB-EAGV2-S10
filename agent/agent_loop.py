@@ -4,7 +4,7 @@ from typing import Optional
 from perception.perception import Perception
 from decision.decision import Decision
 from action.executor import run_user_code
-from agent.agentSession import AgentSession, PerceptionSnapshot, Step, ToolCode
+from agent.agentSession import AgentSession, PerceptionSnapshot, Step, ToolCode, StepType, StepStatus
 from memory.session_log import live_update_session as live_update_session_async
 from memory.memory_search import MemorySearch
 from mcp_servers.multiMCP import MultiMCP
@@ -18,6 +18,7 @@ _config = _config_manager.config
 MAX_PREVIOUS_FAILURE_STEPS = _config.memory.max_previous_failure_steps
 MAX_ITERATIONS = _config.agent.max_iterations
 
+NUM_DASHES = 150 
 
 class AgentLoop:
     """
@@ -198,11 +199,11 @@ class AgentLoop:
         return Step(
             index=decision_output["step_index"],
             description=decision_output["description"],
-            type=decision_output["type"],
+            type=decision_output["type"],  # Will be normalized by Pydantic validator
             code=ToolCode(
                 tool_name="raw_code_block",
                 tool_arguments={"code": decision_output["code"]}
-            ) if decision_output["type"] == "CODE" else None,
+            ) if decision_output.get("type", "").upper() in ("CODE", StepType.CODE.value) else None,
             conclusion=decision_output.get("conclusion"),
         )
 
@@ -220,16 +221,15 @@ class AgentLoop:
         """
         print(f"\n[Step {step.index}] {step.description}")
 
-        if step.type == "CODE":
+        if step.type == StepType.CODE:
             return await self._execute_code_step(step, session, session_memory)
-        elif step.type == "CONCLUDE":
+        elif step.type == StepType.CONCLUDE:
             return await self._execute_conclude_step(step, session, session_memory)
-        elif step.type == "NOP":
+        elif step.type in (StepType.NOP, StepType.NOOP):
             return await self._execute_nop_step(step, session)
         else:
             print(f"⚠️ Unknown step type: {step.type}")
-            step.status = "failed"
-            return step
+            return step.mark_failed(f"Unknown step type: {step.type}")
 
     async def _execute_code_step(
         self, 
@@ -238,7 +238,7 @@ class AgentLoop:
         session_memory: list
     ) -> Step:
         """Execute a CODE step."""
-        print("-" * 50)
+        print("-" * NUM_DASHES)
         print("[EXECUTING CODE]")
         print(step.code.tool_arguments["code"])
         
@@ -247,17 +247,17 @@ class AgentLoop:
                 step.code.tool_arguments["code"], 
                 self.multi_mcp
             )
-            step.execution_result = executor_response
-            step.status = "completed"
+            step = step.mark_completed(executor_response)
 
             # Run perception on execution result
+            current_plan_text = session.plan_versions[-1].plan_text if session.plan_versions else []
             perception_result = self.run_perception(
                 query=executor_response.get('result', 'Tool Failed'),
                 memory_results=session_memory,
-                current_plan=session.plan_versions[-1]["plan_text"],
+                current_plan=current_plan_text,
                 snapshot_type="step_result"
             )
-            step.perception = PerceptionSnapshot(**perception_result)
+            step = step.model_copy(update={'perception': PerceptionSnapshot(**perception_result)})
 
             # Track failures in session memory
             if not step.perception or not step.perception.local_goal_achieved:
@@ -277,9 +277,10 @@ class AgentLoop:
             
         except Exception as e:
             print(f"❌ Error executing code step: {e}")
-            step.status = "failed"
-            step.error = str(e)
-            step.execution_result = {"status": "error", "error": str(e)}
+            step = step.mark_failed(str(e))
+            step = step.model_copy(update={
+                'execution_result': {"status": "error", "error": str(e)}
+            })
             await live_update_session_async(session)
             return step
 
@@ -291,16 +292,14 @@ class AgentLoop:
     ) -> None:
         """Execute a CONCLUDE step."""
         print(f"\n💡 Conclusion: {step.conclusion}")
-        step.execution_result = step.conclusion
-        step.status = "completed"
 
         perception_result = self.run_perception(
             query=step.conclusion,
             memory_results=session_memory,
-            current_plan=session.plan_versions[-1]["plan_text"],
+            current_plan=session.plan_versions[-1].plan_text if session.plan_versions else [],
             snapshot_type="step_result"
         )
-        step.perception = PerceptionSnapshot(**perception_result)
+        perception = PerceptionSnapshot(**perception_result)
         
         # Handle "Not ready yet" case
         if 'Not ready yet' in perception_result.get('solution_summary', ''):
@@ -309,17 +308,18 @@ class AgentLoop:
                 perception_result.get('local_reasoning', '') +
                 "\nIf you disagree, try to be more specific in your query.\n"
             )
-            step.perception = PerceptionSnapshot(**perception_result)
+            perception = PerceptionSnapshot(**perception_result)
         
-        session.add_perception(step.perception)
-        session.mark_complete(step.perception, final_answer=step.conclusion)
+        step = step.mark_completed(step.conclusion, perception)
+        session.add_perception(perception)
+        session.mark_complete(perception, final_answer=step.conclusion)
         await live_update_session_async(session)
         return None  # Signal to stop execution
 
     async def _execute_nop_step(self, step: Step, session: AgentSession) -> None:
         """Execute a NOP (no operation) step."""
         print(f"\n❓ Clarification needed: {step.description}")
-        step.status = "clarification_needed"
+        step = step.model_copy(update={'status': StepStatus.CLARIFICATION_NEEDED})
         await live_update_session_async(session)
         return None  # Signal to stop execution
 
@@ -357,7 +357,10 @@ class AgentLoop:
     def get_next_step(self, session: AgentSession, query: str, step: Step) -> Optional[Step]:
         """Get the next step in the current plan."""
         next_index = step.index + 1
-        total_steps = len(session.plan_versions[-1]["plan_text"])
+        if not session.plan_versions:
+            return None
+        current_plan = session.plan_versions[-1]
+        total_steps = len(current_plan.plan_text)
         
         if next_index < total_steps:
             print(f"\n➡️ Proceeding to Step {next_index}...")
@@ -367,11 +370,11 @@ class AgentLoop:
                 "planning_strategy": self.strategy,
                 "original_query": query,
                 "current_plan_version": len(session.plan_versions),
-                "current_plan": session.plan_versions[-1]["plan_text"],
+                "current_plan": current_plan.plan_text,
                 "completed_steps": [
                     s.to_dict() 
-                    for s in session.plan_versions[-1]["steps"] 
-                    if s.status == "completed"
+                    for s in current_plan.steps 
+                    if s.status == StepStatus.COMPLETED
                 ],
                 "current_step": step.to_dict()
             })
@@ -388,29 +391,39 @@ class AgentLoop:
 
     def _replan(self, session: AgentSession, query: str, step: Step) -> Optional[Step]:
         """Generate a new plan after step failure."""
+        if not session.plan_versions:
+            return None
+        current_plan = session.plan_versions[-1]
+        
         decision_output = self.decision.run({
             "plan_mode": "mid_session",
             "planning_strategy": self.strategy,
             "original_query": query,
             "current_plan_version": len(session.plan_versions),
-            "current_plan": session.plan_versions[-1]["plan_text"],
+            "current_plan": current_plan.plan_text,
             "completed_steps": [
                 s.to_dict() 
-                for s in session.plan_versions[-1]["steps"] 
-                if s.status == "completed"
+                for s in current_plan.steps 
+                if s.status == StepStatus.COMPLETED
             ],
             "current_step": step.to_dict()
         })
         
         new_step = session.add_plan_version(
             decision_output["plan_text"],
-            [self.create_step(decision_output)]
+            [self.create_step(decision_output)],
+            reason=f"Replanned after step {step.index} failure"
         )
         self.print_plan_version(session, len(session.plan_versions))
         return new_step
 
     def print_plan_version(self, session: AgentSession, version_num: int) -> None:
         """Print the current plan version."""
+        if not session.plan_versions:
+            return
+        current_plan = session.plan_versions[-1]
         print(f"\n[Decision Plan Text: V{version_num}]:")
-        for line in session.plan_versions[-1]["plan_text"]:
+        if current_plan.reason:
+            print(f"  Reason: {current_plan.reason}")
+        for line in current_plan.plan_text:
             print(f"  {line}")

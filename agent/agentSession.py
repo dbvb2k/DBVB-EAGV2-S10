@@ -1,137 +1,443 @@
-from dataclasses import dataclass, asdict
-from typing import Any, Literal, Optional
-import uuid
-import time
+"""
+Agent Session Models - Pydantic Models for Type Safety and Validation
+
+This module provides Pydantic models for agent session management:
+- ToolCode: Immutable tool invocation metadata
+- PerceptionSnapshot: Immutable perception analysis snapshot with confidence validation
+- Step: Enhanced step with status transitions and dependency tracking
+- PlanVersion: Plan version with metadata and versioning support
+"""
+from pydantic import BaseModel, Field, field_validator, ConfigDict
+from typing import Any, List, Optional, Dict
+from enum import Enum
+from datetime import datetime
+from decimal import Decimal
 import json
+import time
 
-@dataclass
-class ToolCode:
-    tool_name: str
-    tool_arguments: dict[str, Any]
 
-    def to_dict(self):
+def _convert_decimals_to_str(obj: Any) -> Any:
+    """Recursively convert Decimal values to strings for JSON serialization."""
+    if isinstance(obj, Decimal):
+        return str(obj)
+    elif isinstance(obj, dict):
+        return {k: _convert_decimals_to_str(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_decimals_to_str(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_convert_decimals_to_str(item) for item in obj)
+    else:
+        return obj
+
+
+class StepType(str, Enum):
+    """Valid step types."""
+    CODE = "CODE"
+    CONCLUDE = "CONCLUDE"
+    NOP = "NOP"
+    NOOP = "NOOP"  # Alias for NOP for backward compatibility
+
+
+class StepStatus(str, Enum):
+    """Valid step statuses."""
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    CLARIFICATION_NEEDED = "clarification_needed"
+    RETRYING = "retrying"
+    CANCELLED = "cancelled"
+
+
+class ToolCode(BaseModel):
+    """Immutable tool code representation."""
+    tool_name: str = Field(min_length=1, description="Tool name")
+    tool_arguments: Dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
+    
+    model_config = ConfigDict(frozen=True)  # Immutable in Pydantic v2
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary (for backward compatibility)."""
         return {
             "tool_name": self.tool_name,
             "tool_arguments": self.tool_arguments
         }
 
 
-@dataclass
-class PerceptionSnapshot:
-    entities: list[str]
-    result_requirement: str
-    original_goal_achieved: bool
-    reasoning: str
-    local_goal_achieved: bool
-    local_reasoning: str
-    last_tooluse_summary: str
-    solution_summary: str
-    confidence: str
+class PerceptionSnapshot(BaseModel):
+    """Immutable perception snapshot with confidence validation."""
+    entities: List[str] = Field(default_factory=list, description="Extracted entities")
+    result_requirement: str = Field(default="", description="Result requirement description")
+    original_goal_achieved: bool = Field(default=False, description="Whether original goal is achieved")
+    reasoning: str = Field(default="", description="Reasoning about goal achievement")
+    local_goal_achieved: bool = Field(default=False, description="Whether local/step goal is achieved")
+    local_reasoning: str = Field(default="", description="Reasoning about local goal")
+    last_tooluse_summary: str = Field(default="", description="Summary of last tool use")
+    solution_summary: str = Field(default="", description="Solution summary")
+    confidence: Decimal = Field(
+        default=Decimal("0.0"),
+        ge=Decimal("0.0"),
+        le=Decimal("1.0"),
+        description="Confidence score (0.0-1.0)"
+    )
+    created_at: datetime = Field(default_factory=datetime.now, description="Creation timestamp")
+    
+    model_config = ConfigDict(
+        frozen=True,  # Immutable in Pydantic v2
+        json_encoders={Decimal: str, datetime: lambda v: v.isoformat()}
+    )
+    
+    @field_validator('confidence', mode='before')
+    @classmethod
+    def parse_confidence(cls, v: Any) -> Decimal:
+        """Parse and validate confidence value."""
+        if isinstance(v, str):
+            try:
+                conf_decimal = Decimal(v)
+            except (ValueError, TypeError):
+                return Decimal("0.0")
+        elif isinstance(v, (int, float)):
+            conf_decimal = Decimal(str(v))
+        elif isinstance(v, Decimal):
+            conf_decimal = v
+        else:
+            return Decimal("0.0")
+        
+        # Clamp to [0.0, 1.0]
+        return max(Decimal("0.0"), min(Decimal("1.0"), conf_decimal))
+    
+    @field_validator('entities', mode='before')
+    @classmethod
+    def validate_entities(cls, v: Any) -> List[str]:
+        """Ensure entities is a list of strings."""
+        if not isinstance(v, list):
+            return []
+        return [str(e) for e in v]
+    
+    @field_validator('original_goal_achieved', 'local_goal_achieved', mode='before')
+    @classmethod
+    def normalize_bool(cls, v: Any) -> bool:
+        """Normalize boolean values from various formats."""
+        if isinstance(v, str):
+            return v.lower() in ("true", "1", "yes", "on")
+        return bool(v)
 
-@dataclass
-class Step:
-    index: int
-    description: str
-    type: Literal["CODE", "CONCLUDE", "NOOP"]
+
+class Step(BaseModel):
+    """Enhanced step in agent execution with full validation and status transitions."""
+    index: int = Field(ge=0, description="Step index")
+    description: str = Field(min_length=1, description="Step description")
+    type: StepType = Field(description="Step type")
+    status: StepStatus = Field(default=StepStatus.PENDING, description="Step status")
+    
+    # Type-specific fields
     code: Optional[ToolCode] = None
     conclusion: Optional[str] = None
-    execution_result: Optional[str] = None
+    
+    # Execution results
+    execution_result: Optional[Any] = None
     error: Optional[str] = None
     perception: Optional[PerceptionSnapshot] = None
-    status: Literal["pending", "completed", "failed", "skipped"] = "pending"
-    attempts: int = 0
-    was_replanned: bool = False
-    parent_index: Optional[int] = None
-
-    def to_dict(self):
-        return {
+    
+    # Metadata and tracking
+    attempts: int = Field(default=0, ge=0, description="Number of attempts")
+    was_replanned: bool = Field(default=False, description="Whether step was replanned")
+    parent_index: Optional[int] = Field(default=None, ge=0, description="Parent step index if replanned")
+    dependencies: List[int] = Field(default_factory=list, description="Step dependencies (list of step indices)")
+    
+    # Timestamps
+    created_at: datetime = Field(default_factory=datetime.now, description="Creation timestamp")
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    
+    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
+    
+    @field_validator('type', mode='before')
+    @classmethod
+    def normalize_step_type(cls, v: Any) -> StepType:
+        """Normalize step type to enum."""
+        if isinstance(v, str):
+            v = v.upper()
+            # Handle NOOP alias for backward compatibility
+            if v == "NOOP":
+                v = "NOP"
+            try:
+                return StepType[v]
+            except KeyError:
+                raise ValueError(f"Invalid step type: {v}")
+        return v
+    
+    @field_validator('status', mode='before')
+    @classmethod
+    def normalize_status(cls, v: Any) -> StepStatus:
+        """Normalize status to enum."""
+        if isinstance(v, str):
+            try:
+                return StepStatus[v.upper()]
+            except KeyError:
+                # Try lowercase
+                try:
+                    return StepStatus(v.lower())
+                except ValueError:
+                    return StepStatus.PENDING
+        return v
+    
+    @field_validator('code')
+    @classmethod
+    def validate_code_for_type(cls, v: Optional[ToolCode], info) -> Optional[ToolCode]:
+        """Validate code is present for CODE type steps."""
+        step_type = info.data.get('type')
+        if step_type == StepType.CODE and v is None:
+            raise ValueError("CODE step type requires code")
+        return v
+    
+    @field_validator('conclusion')
+    @classmethod
+    def validate_conclusion_for_type(cls, v: Optional[str], info) -> Optional[str]:
+        """Validate conclusion is present for CONCLUDE type steps."""
+        step_type = info.data.get('type')
+        if step_type == StepType.CONCLUDE and (v is None or not v.strip()):
+            raise ValueError("CONCLUDE step type requires non-empty conclusion")
+        return v
+    
+    def mark_started(self) -> 'Step':
+        """Create new step with started_at timestamp and RETRYING status."""
+        return self.model_copy(update={
+            'started_at': datetime.now(),
+            'status': StepStatus.RETRYING if self.attempts > 0 else self.status
+        })
+    
+    def mark_completed(self, result: Any, perception: Optional[PerceptionSnapshot] = None) -> 'Step':
+        """Create new step with completion data."""
+        return self.model_copy(update={
+            'status': StepStatus.COMPLETED,
+            'completed_at': datetime.now(),
+            'execution_result': result,
+            'perception': perception
+        })
+    
+    def mark_failed(self, error: str) -> 'Step':
+        """Create new step with failure data."""
+        return self.model_copy(update={
+            'status': StepStatus.FAILED,
+            'completed_at': datetime.now(),
+            'error': error,
+            'attempts': self.attempts + 1
+        })
+    
+    def mark_skipped(self, reason: Optional[str] = None) -> 'Step':
+        """Create new step with skipped status."""
+        return self.model_copy(update={
+            'status': StepStatus.SKIPPED,
+            'completed_at': datetime.now(),
+            'error': reason
+        })
+    
+    def add_dependency(self, step_index: int) -> 'Step':
+        """Add a dependency on another step."""
+        if step_index not in self.dependencies:
+            new_deps = list(self.dependencies) + [step_index]
+            return self.model_copy(update={'dependencies': new_deps})
+        return self
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary (for backward compatibility)."""
+        result = {
             "index": self.index,
             "description": self.description,
-            "type": self.type,
-            "code": self.code.to_dict() if self.code else None,
+            "type": self.type.value,
+            "code": self.code.model_dump(mode='json') if self.code else None,
             "conclusion": self.conclusion,
             "execution_result": self.execution_result,
             "error": self.error,
-            "perception": self.perception.__dict__ if self.perception else None,
-            "status": self.status,
+            "perception": self.perception.model_dump(mode='json') if self.perception else None,
+            "status": self.status.value,
             "attempts": self.attempts,
             "was_replanned": self.was_replanned,
-            "parent_index": self.parent_index
+            "parent_index": self.parent_index,
+            "dependencies": self.dependencies,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None
+        }
+        return result
+
+
+class PlanVersion(BaseModel):
+    """Plan version with metadata and versioning support."""
+    version_id: int = Field(ge=0, description="Plan version ID")
+    created_at: datetime = Field(default_factory=datetime.now, description="Creation timestamp")
+    reason: str = Field(default="", description="Reason for creating this version")
+    parent_version_id: Optional[int] = Field(default=None, ge=0, description="Parent version ID if replanned")
+    plan_text: List[str] = Field(default_factory=list, description="Full plan text")
+    steps: List[Step] = Field(default_factory=list, description="Steps in this plan version")
+    
+    # Optional metrics
+    estimated_duration: Optional[float] = Field(default=None, ge=0, description="Estimated duration in seconds")
+    complexity_score: Optional[float] = Field(default=None, ge=0, description="Complexity score")
+    
+    model_config = ConfigDict(json_encoders={datetime: lambda v: v.isoformat()})
+    
+    def get_step_by_index(self, index: int) -> Optional[Step]:
+        """Get step by index in this plan version."""
+        return next((s for s in self.steps if s.index == index), None)
+    
+    def get_completed_steps(self) -> List[Step]:
+        """Get all completed steps in this plan version."""
+        return [s for s in self.steps if s.status == StepStatus.COMPLETED]
+    
+    def get_pending_steps(self) -> List[Step]:
+        """Get all pending steps in this plan version."""
+        return [s for s in self.steps if s.status == StepStatus.PENDING]
+    
+    def get_failed_steps(self) -> List[Step]:
+        """Get all failed steps in this plan version."""
+        return [s for s in self.steps if s.status == StepStatus.FAILED]
+    
+    def update_step(self, step_index: int, updated_step: Step) -> 'PlanVersion':
+        """Create new plan version with updated step."""
+        new_steps = []
+        updated = False
+        for step in self.steps:
+            if step.index == step_index:
+                new_steps.append(updated_step)
+                updated = True
+            else:
+                new_steps.append(step)
+        
+        if not updated:
+            raise ValueError(f"Step {step_index} not found in plan version {self.version_id}")
+        
+        return self.model_copy(update={"steps": new_steps})
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary (for backward compatibility)."""
+        return {
+            "version_id": self.version_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "reason": self.reason,
+            "parent_version_id": self.parent_version_id,
+            "plan_text": self.plan_text,
+            "steps": [s.to_dict() for s in self.steps],
+            "estimated_duration": self.estimated_duration,
+            "complexity_score": self.complexity_score
         }
 
 
 class AgentSession:
+    """Agent session managing the complete agent lifecycle."""
+    
     def __init__(self, session_id: str, original_query: str):
         self.session_id = session_id
         self.original_query = original_query
         self.perception: Optional[PerceptionSnapshot] = None
-        self.plan_versions: list[dict[str, Any]] = []
+        self.plan_versions: List[PlanVersion] = []  # Now using PlanVersion instead of dict
         self.state = {
             "original_goal_achieved": False,
             "final_answer": None,
-            "confidence": 0.0,
+            "confidence": Decimal("0.0"),  # Changed to Decimal
             "reasoning_note": "",
             "solution_summary": ""
-            
         }
 
-    def add_perception(self, snapshot: PerceptionSnapshot):
+    def add_perception(self, snapshot: PerceptionSnapshot) -> None:
+        """Add a perception snapshot."""
         self.perception = snapshot
 
-    def add_plan_version(self, plan_texts: list[str], steps: list[Step]):
-        plan = {
-            "plan_text": plan_texts,
-            "steps": steps.copy()
-        }
+    def add_plan_version(
+        self,
+        plan_texts: List[str],
+        steps: List[Step],
+        reason: str = ""
+    ) -> Optional[Step]:
+        """Add a new plan version with metadata."""
+        version_id = len(self.plan_versions)
+        parent_version_id = version_id - 1 if version_id > 0 else None
+        
+        plan = PlanVersion(
+            version_id=version_id,
+            plan_text=plan_texts,
+            steps=[step.model_copy() for step in steps],  # Deep copy using Pydantic
+            reason=reason,
+            parent_version_id=parent_version_id
+        )
         self.plan_versions.append(plan)
-        return steps[0] if steps else None  # ✅ fix: return first Step
+        return steps[0] if steps else None
+
+    def get_current_plan(self) -> Optional[PlanVersion]:
+        """Get the current (latest) plan version."""
+        return self.plan_versions[-1] if self.plan_versions else None
 
     def get_next_step_index(self) -> int:
-        return sum(len(v["steps"]) for v in self.plan_versions)
+        """Get the next step index across all plan versions."""
+        return sum(len(v.steps) for v in self.plan_versions)
 
+    def get_all_steps(self) -> List[Step]:
+        """Get all steps from all plan versions."""
+        steps = []
+        for plan in self.plan_versions:
+            steps.extend(plan.steps)
+        return steps
 
-    def to_json(self):
-        return {
+    def get_step_by_index(self, index: int) -> Optional[Step]:
+        """Get step by index across all plan versions."""
+        for plan in self.plan_versions:
+            step = plan.get_step_by_index(index)
+            if step:
+                return step
+        return None
+
+    def to_json(self) -> Dict[str, Any]:
+        """Convert session to JSON-serializable dictionary."""
+        result = {
             "session_id": self.session_id,
             "original_query": self.original_query,
-            "perception": asdict(self.perception) if self.perception else None,
-            "plan_versions": [
-                {
-                    "plan_text": p["plan_text"],
-                    "steps": [asdict(s) for s in p["steps"]]
-                } for p in self.plan_versions
-            ],
+            "perception": self.perception.model_dump(mode='json') if self.perception else None,
+            "plan_versions": [p.to_dict() for p in self.plan_versions],
             "state_snapshot": self.get_snapshot_summary()
         }
+        # Ensure all Decimal values are converted to strings
+        return _convert_decimals_to_str(result)
 
-    def get_snapshot_summary(self):
+    def get_snapshot_summary(self) -> Dict[str, Any]:
+        """Get a summary snapshot of the session."""
         return {
             "session_id": self.session_id,
             "query": self.original_query,
-            "final_plan": self.plan_versions[-1]["plan_text"] if self.plan_versions else [],
-           "final_steps": [
-                    asdict(s)
-                    for version in self.plan_versions
-                    for s in version["steps"]
-                    if s.status == "completed"
-                ],
+            "final_plan": self.plan_versions[-1].plan_text if self.plan_versions else [],
+            "final_steps": [
+                s.to_dict()
+                for version in self.plan_versions
+                for s in version.steps
+                if s.status == StepStatus.COMPLETED
+            ],
             "final_answer": self.state["final_answer"],
-            "confidence": self.state["confidence"],
+            "confidence": str(self.state["confidence"]),  # Convert Decimal to string
             "reasoning_note": self.state["reasoning_note"]
         }
 
-    def mark_complete(self, perception: PerceptionSnapshot, final_answer: Optional[str] = None, fallback_confidence: float = 0.95):
+    def mark_complete(
+        self,
+        perception: PerceptionSnapshot,
+        final_answer: Optional[str] = None,
+        fallback_confidence: Optional[Decimal] = None
+    ) -> None:
+        """Mark session as complete with perception and final answer."""
+        if fallback_confidence is None:
+            fallback_confidence = Decimal("0.95")
+        
         self.state.update({
             "original_goal_achieved": perception.original_goal_achieved,
             "final_answer": final_answer or perception.solution_summary,
-            "confidence": perception.confidence or fallback_confidence,
+            "confidence": perception.confidence if perception.confidence > Decimal("0.0") else fallback_confidence,
             "reasoning_note": perception.reasoning,
             "solution_summary": perception.solution_summary
         })
 
 
 
-    def simulate_live(self, delay: float = 1.2):
+    def simulate_live(self, delay: float = 1.2) -> None:
+        """Simulate live session trace with delays."""
         print("\n=== LIVE AGENT SESSION TRACE ===")
         print(f"Session ID: {self.session_id}")
         print(f"Query: {self.original_query}")
@@ -139,20 +445,22 @@ class AgentSession:
 
         if self.perception:
             print("\n[Perception 0] Initial ERORLL:")
-            print(f"  {asdict(self.perception)}")
+            print(f"  {self.perception.model_dump()}")
             time.sleep(delay)
 
         for i, version in enumerate(self.plan_versions):
-            print(f"\n[Decision Plan Text: V{i+1}]:")
-            for j, p in enumerate(version["plan_text"]):
+            print(f"\n[Decision Plan Text: V{version.version_id + 1}]:")
+            if version.reason:
+                print(f"  Reason: {version.reason}")
+            for j, p in enumerate(version.plan_text):
                 print(f"  Step {j}: {p}")
             time.sleep(delay)
 
-            for step in version["steps"]:
+            for step in version.steps:
                 print(f"\n[Step {step.index}] {step.description}")
                 time.sleep(delay / 1.5)
 
-                print(f"  Type: {step.type}")
+                print(f"  Type: {step.type.value}")
                 if step.code:
                     print(f"  Tool → {step.code.tool_name} | Args → {step.code.tool_arguments}")
                 if step.execution_result:
@@ -163,13 +471,19 @@ class AgentSession:
                     print(f"  Error: {step.error}")
                 if step.perception:
                     print("  Perception ERORLL:")
-                    for k, v in asdict(step.perception).items():
+                    for k, v in step.perception.model_dump().items():
                         print(f"    {k}: {v}")
-                print(f"  Status: {step.status}")
+                print(f"  Status: {step.status.value}")
                 if step.was_replanned:
                     print(f"  (Replanned from Step {step.parent_index})")
+                if step.dependencies:
+                    print(f"  Dependencies: {step.dependencies}")
                 if step.attempts > 1:
                     print(f"  Attempts: {step.attempts}")
+                if step.started_at:
+                    print(f"  Started: {step.started_at.isoformat()}")
+                if step.completed_at:
+                    print(f"  Completed: {step.completed_at.isoformat()}")
                 time.sleep(delay)
 
         print("\n[Session Snapshot]:")
