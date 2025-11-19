@@ -84,11 +84,52 @@ async def append_session_to_store(session_obj, base_dir: str = "memory/session_l
             print(f"⚠️ Warning: Error reading existing file {store_path}: {e}")
 
     # Write session data
+    # First write to a temporary file, then rename on success
+    temp_path = store_path.with_suffix('.tmp')
     try:
-        async with aiofiles.open(store_path, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(session_data, indent=2, cls=DecimalEncoder))
+        # Write to temporary file first
+        async with aiofiles.open(temp_path, "w", encoding="utf-8") as f:
+            json_str = json.dumps(session_data, indent=2, cls=DecimalEncoder)
+            if not json_str or json_str.strip() == "":
+                raise ValueError("Generated JSON string is empty")
+            await f.write(json_str)
+            await f.flush()  # Ensure data is written to disk
+        
+        # Verify the temporary file is not empty
+        temp_size = await aiofiles.os.path.getsize(temp_path)
+        if temp_size == 0:
+            raise ValueError(f"Temporary file is empty after write: {temp_path}")
+        
+        # Validate JSON by reading it back
+        async with aiofiles.open(temp_path, "r", encoding="utf-8") as f:
+            test_content = await f.read()
+            json.loads(test_content)  # Validate JSON structure
+        
+        # If validation succeeds, rename temp file to final location
+        # Remove old file if it exists (Windows requires this)
+        if await aiofiles.os.path.exists(store_path):
+            await aiofiles.os.remove(store_path)
+        await aiofiles.os.rename(temp_path, store_path)
+        
         print(f"✅ Session stored: {store_path}")
     except Exception as e:
+        # Clean up temporary file on error
+        try:
+            if await aiofiles.os.path.exists(temp_path):
+                await aiofiles.os.remove(temp_path)
+        except Exception:
+            pass  # Ignore cleanup errors
+        
+        # Remove empty/corrupted file if it exists
+        try:
+            if await aiofiles.os.path.exists(store_path):
+                file_size = await aiofiles.os.path.getsize(store_path)
+                if file_size == 0:
+                    await aiofiles.os.remove(store_path)
+                    print(f"🗑️ Removed empty file: {store_path}")
+        except Exception:
+            pass  # Ignore cleanup errors
+        
         print(f"❌ Failed to write session to {store_path}: {e}")
         raise
 

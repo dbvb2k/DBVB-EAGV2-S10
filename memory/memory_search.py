@@ -64,9 +64,25 @@ class MemorySearch:
             async with semaphore:
                 count_before = len(memory_entries)
                 try:
+                    # Check if file is empty before trying to read
+                    try:
+                        file_size = await aiofiles.os.path.getsize(file)
+                        if file_size == 0:
+                            print(f"⚠️ Skipping '{file}' (empty file)")
+                            return
+                    except Exception:
+                        # If we can't get size, continue and try to read anyway
+                        pass
+                    
                     async with aiofiles.open(file, 'r', encoding='utf-8') as f:
-                        content_str = await f.read()
-                        content = json.loads(content_str)
+                        content_str = await f.read().strip()
+                    
+                    # Check if content is empty after reading
+                    if not content_str:
+                        print(f"⚠️ Skipping '{file}' (empty file after reading)")
+                        return
+                    
+                    content = json.loads(content_str)
 
                     if isinstance(content, list):  # FORMAT 1
                         for session in content:
@@ -78,7 +94,12 @@ class MemorySearch:
                             await self._extract_entry(turn, file.name, memory_entries)
 
                 except json.JSONDecodeError as e:
-                    print(f"⚠️ Skipping '{file}' (invalid JSON): {e}")
+                    # Provide more helpful error message
+                    error_msg = str(e)
+                    if "Expecting value: line 1 column 1" in error_msg:
+                        print(f"⚠️ Skipping '{file}' (empty or corrupted JSON file)")
+                    else:
+                        print(f"⚠️ Skipping '{file}' (invalid JSON): {e}")
                 except Exception as e:
                     print(f"⚠️ Skipping '{file}': {e}")
 
