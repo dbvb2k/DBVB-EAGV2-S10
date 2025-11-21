@@ -7,8 +7,8 @@ This module provides Pydantic models for agent session management:
 - Step: Enhanced step with status transitions and dependency tracking
 - PlanVersion: Plan version with metadata and versioning support
 """
-from pydantic import BaseModel, Field, field_validator, ConfigDict
-from typing import Any, List, Optional, Dict
+from pydantic import BaseModel, Field, field_validator, ConfigDict, model_validator
+from typing import Any, List, Optional, Dict, Protocol
 from enum import Enum
 from datetime import datetime
 from decimal import Decimal
@@ -324,25 +324,323 @@ class PlanVersion(BaseModel):
         }
 
 
-class AgentSession:
-    """Agent session managing the complete agent lifecycle."""
+class SessionState(BaseModel):
+    """Immutable session state with proper validation."""
+    original_goal_achieved: bool = Field(default=False, description="Whether goal is achieved")
+    final_answer: Optional[str] = Field(default=None, description="Final answer")
+    confidence: Decimal = Field(
+        default=Decimal("0.0"),
+        ge=Decimal("0.0"),
+        le=Decimal("1.0"),
+        description="Confidence score (0.0-1.0)"
+    )
+    reasoning_note: str = Field(default="", description="Reasoning note")
+    solution_summary: str = Field(default="", description="Solution summary")
     
-    def __init__(self, session_id: str, original_query: str):
+    model_config = ConfigDict(
+        frozen=True,  # Immutable in Pydantic v2
+        json_encoders={Decimal: str}
+    )
+    
+    def update_with_perception(
+        self,
+        perception: PerceptionSnapshot,
+        final_answer: Optional[str] = None
+    ) -> 'SessionState':
+        """Create new state from perception (immutable update)."""
+        return self.model_copy(update={
+            'original_goal_achieved': perception.original_goal_achieved,
+            'final_answer': final_answer or perception.solution_summary,
+            'confidence': perception.confidence if perception.confidence > Decimal("0.0") else self.confidence,
+            'reasoning_note': perception.reasoning,
+            'solution_summary': perception.solution_summary
+        })
+
+
+class SessionMetadata(BaseModel):
+    """Session metadata for extensibility."""
+    user_id: Optional[str] = Field(default=None, description="User identifier")
+    context: Dict[str, Any] = Field(default_factory=dict, description="Additional context")
+    tags: List[str] = Field(default_factory=list, description="Session tags")
+    custom_fields: Dict[str, Any] = Field(default_factory=dict, description="Custom fields")
+    
+    model_config = ConfigDict(json_encoders={})
+
+
+class SessionObserver(Protocol):
+    """Protocol for session state change observers."""
+    
+    def on_state_change(
+        self,
+        session: 'AgentSession',
+        old_state: SessionState,
+        new_state: SessionState
+    ) -> None:
+        """Called when session state changes."""
+        ...
+    
+    def on_plan_added(self, session: 'AgentSession', plan: PlanVersion) -> None:
+        """Called when a new plan version is added."""
+        ...
+    
+    def on_perception_added(self, session: 'AgentSession', perception: PerceptionSnapshot) -> None:
+        """Called when a perception snapshot is added."""
+        ...
+    
+    def on_lifecycle_state_change(
+        self,
+        session: 'AgentSession',
+        old_state: str,
+        new_state: str,
+        data: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Called when session lifecycle state changes."""
+        ...
+    
+    def on_step_started(self, session: 'AgentSession', step: 'Step') -> None:
+        """Called when a step starts execution."""
+        ...
+    
+    def on_step_completed(self, session: 'AgentSession', step: 'Step') -> None:
+        """Called when a step completes execution."""
+        ...
+    
+    def on_step_failed(self, session: 'AgentSession', step: 'Step', error: str) -> None:
+        """Called when a step fails."""
+        ...
+
+
+class AgentSession:
+    """Agent session managing the complete agent lifecycle with observer pattern and event logging."""
+    
+    def __init__(
+        self,
+        session_id: str,
+        original_query: str,
+        metadata: Optional[SessionMetadata] = None
+    ):
         self.session_id = session_id
         self.original_query = original_query
+        self.metadata = metadata or SessionMetadata()
+        
+        # Timestamps
+        self.created_at: datetime = datetime.now()
+        self.updated_at: datetime = self.created_at
+        self.completed_at: Optional[datetime] = None
+        
+        # State
         self.perception: Optional[PerceptionSnapshot] = None
         self.plan_versions: List[PlanVersion] = []  # Now using PlanVersion instead of dict
-        self.state = {
-            "original_goal_achieved": False,
-            "final_answer": None,
-            "confidence": Decimal("0.0"),  # Changed to Decimal
-            "reasoning_note": "",
-            "solution_summary": ""
+        self.state: SessionState = SessionState()
+        
+        # State machine for lifecycle management
+        from agent.session_state_machine import SessionStateMachine, SessionLifecycleState
+        self._lifecycle_machine = SessionStateMachine(SessionLifecycleState.INITIALIZED)
+        
+        # Observers
+        self._observers: List[SessionObserver] = []
+        
+        # Event log
+        self._event_log: List[Dict[str, Any]] = []
+        
+        # Log initial creation
+        self._log_event("session_created", {
+            "session_id": self.session_id,
+            "original_query": self.original_query,
+            "metadata": self.metadata.model_dump()
+        })
+        
+        # Notify lifecycle state change
+        self._notify_lifecycle_state_change(
+            None,
+            self._lifecycle_machine.current_state.value,
+            {"session_id": self.session_id}
+        )
+        
+        # Notify lifecycle state change
+        self._notify_lifecycle_state_change(
+            None,
+            self._lifecycle_machine.current_state.value,
+            {"session_id": self.session_id}
+        )
+
+    def add_observer(self, observer: SessionObserver) -> None:
+        """Add an observer for state changes."""
+        if observer not in self._observers:
+            self._observers.append(observer)
+
+    def remove_observer(self, observer: SessionObserver) -> None:
+        """Remove an observer."""
+        if observer in self._observers:
+            self._observers.remove(observer)
+
+    def _notify_state_change(self, old_state: SessionState, new_state: SessionState) -> None:
+        """Notify observers of state change."""
+        for observer in self._observers:
+            try:
+                observer.on_state_change(self, old_state, new_state)
+            except Exception as e:
+                print(f"⚠️ Error notifying observer: {e}")
+        
+        self._log_event("state_change", {
+            "old_state": old_state.model_dump(mode='json'),
+            "new_state": new_state.model_dump(mode='json')
+        })
+    
+    def _notify_lifecycle_state_change(
+        self,
+        old_state: Optional[str],
+        new_state: str,
+        data: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Notify observers of lifecycle state change."""
+        for observer in self._observers:
+            try:
+                if hasattr(observer, 'on_lifecycle_state_change'):
+                    observer.on_lifecycle_state_change(self, old_state or "unknown", new_state, data)
+            except Exception as e:
+                print(f"⚠️ Error notifying observer of lifecycle change: {e}")
+        
+        self._log_event("lifecycle_state_change", {
+            "old_state": old_state,
+            "new_state": new_state,
+            "data": data or {}
+        })
+    
+    def transition_lifecycle_state(
+        self,
+        target_state: str,
+        data: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """
+        Transition to a new lifecycle state.
+        
+        Args:
+            target_state: Target state name
+            data: Optional data for the transition
+            
+        Returns:
+            True if transition succeeded, False otherwise
+        """
+        from agent.session_state_machine import SessionLifecycleState
+        
+        try:
+            # Convert string to enum
+            if isinstance(target_state, str):
+                target_state_enum = SessionLifecycleState[target_state.upper()]
+            else:
+                target_state_enum = target_state
+            
+            old_state = self._lifecycle_machine.current_state.value
+            success = self._lifecycle_machine.transition_to(target_state_enum, data)
+            
+            if success:
+                self._notify_lifecycle_state_change(
+                    old_state,
+                    self._lifecycle_machine.current_state.value,
+                    data
+                )
+            
+            return success
+        except (KeyError, ValueError) as e:
+            print(f"⚠️ Invalid lifecycle state transition: {e}")
+            return False
+    
+    @property
+    def lifecycle_state(self) -> str:
+        """Get current lifecycle state."""
+        return self._lifecycle_machine.current_state.value
+    
+    def notify_step_started(self, step: Step) -> None:
+        """Notify observers that a step has started."""
+        for observer in self._observers:
+            try:
+                if hasattr(observer, 'on_step_started'):
+                    observer.on_step_started(self, step)
+            except Exception as e:
+                print(f"⚠️ Error notifying observer of step start: {e}")
+        
+        self._log_event("step_started", {
+            "step_index": step.index,
+            "step_type": step.type.value,
+            "description": step.description
+        })
+    
+    def notify_step_completed(self, step: Step) -> None:
+        """Notify observers that a step has completed."""
+        for observer in self._observers:
+            try:
+                if hasattr(observer, 'on_step_completed'):
+                    observer.on_step_completed(self, step)
+            except Exception as e:
+                print(f"⚠️ Error notifying observer of step completion: {e}")
+        
+        self._log_event("step_completed", {
+            "step_index": step.index,
+            "step_type": step.type.value,
+            "status": step.status.value
+        })
+    
+    def notify_step_failed(self, step: Step, error: str) -> None:
+        """Notify observers that a step has failed."""
+        for observer in self._observers:
+            try:
+                if hasattr(observer, 'on_step_failed'):
+                    observer.on_step_failed(self, step, error)
+            except Exception as e:
+                print(f"⚠️ Error notifying observer of step failure: {e}")
+        
+        self._log_event("step_failed", {
+            "step_index": step.index,
+            "step_type": step.type.value,
+            "error": error
+        })
+
+    def _log_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """Log an event to the audit trail."""
+        event = {
+            "type": event_type,
+            "timestamp": datetime.now().isoformat(),
+            "data": data
         }
+        self._event_log.append(event)
+        self.updated_at = datetime.now()
+        
+        # Limit event log size to prevent memory issues (keep last 1000 events)
+        if len(self._event_log) > 1000:
+            self._event_log = self._event_log[-1000:]
+
+    def get_event_log(self, event_type: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Get event log entries, optionally filtered by type and limited in count."""
+        events = self._event_log
+        if event_type:
+            events = [e for e in events if e.get("type") == event_type]
+        if limit:
+            events = events[-limit:]  # Get last N events
+        return events
 
     def add_perception(self, snapshot: PerceptionSnapshot) -> None:
-        """Add a perception snapshot."""
+        """Add a perception snapshot with validation."""
+        if not isinstance(snapshot, PerceptionSnapshot):
+            raise TypeError(f"snapshot must be PerceptionSnapshot, got {type(snapshot)}")
+        
         self.perception = snapshot
+        self._log_event("perception_added", {
+            "snapshot": snapshot.model_dump(mode='json')
+        })
+        
+        # Transition lifecycle state
+        self.transition_lifecycle_state("PERCEPTION_RECEIVED", {
+            "perception_id": id(snapshot),
+            "original_goal_achieved": snapshot.original_goal_achieved
+        })
+        
+        # Notify observers
+        for observer in self._observers:
+            try:
+                observer.on_perception_added(self, snapshot)
+            except Exception as e:
+                print(f"⚠️ Error notifying observer: {e}")
 
     def add_plan_version(
         self,
@@ -362,7 +660,50 @@ class AgentSession:
             parent_version_id=parent_version_id
         )
         self.plan_versions.append(plan)
+        
+        self._log_event("plan_added", {
+            "version_id": version_id,
+            "reason": reason,
+            "plan_text_count": len(plan_texts),
+            "steps_count": len(steps)
+        })
+        
+        # Transition to PLANNING state if not already there
+        # Can transition from PERCEPTION_RECEIVED or EXECUTING (replanning)
+        current_state = self._lifecycle_machine.current_state.value
+        if current_state == "perception_received" or current_state == "executing":
+            self.transition_lifecycle_state("PLANNING", {
+                "plan_version": version_id,
+                "reason": reason
+            })
+        
+        # Notify observers
+        for observer in self._observers:
+            try:
+                observer.on_plan_added(self, plan)
+            except Exception as e:
+                print(f"⚠️ Error notifying observer: {e}")
+        
         return steps[0] if steps else None
+    
+    def update_step(self, step_index: int, updated_step: Step) -> bool:
+        """Update a step in the current plan version."""
+        if not self.plan_versions:
+            return False
+        
+        current_plan = self.plan_versions[-1]
+        try:
+            new_plan = current_plan.update_step(step_index, updated_step)
+            self.plan_versions[-1] = new_plan
+            
+            self._log_event("step_updated", {
+                "step_index": step_index,
+                "status": updated_step.status.value,
+                "plan_version_id": current_plan.version_id
+            })
+            return True
+        except ValueError:
+            return False
 
     def get_current_plan(self) -> Optional[PlanVersion]:
         """Get the current (latest) plan version."""
@@ -392,9 +733,15 @@ class AgentSession:
         result = {
             "session_id": self.session_id,
             "original_query": self.original_query,
+            "metadata": self.metadata.model_dump(mode='json'),
+            "created_at": self.created_at.isoformat(),
+            "updated_at": self.updated_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "perception": self.perception.model_dump(mode='json') if self.perception else None,
             "plan_versions": [p.to_dict() for p in self.plan_versions],
-            "state_snapshot": self.get_snapshot_summary()
+            "state": self.state.model_dump(mode='json'),
+            "state_snapshot": self.get_snapshot_summary(),
+            "event_log": self._event_log[-100:]  # Include last 100 events
         }
         # Ensure all Decimal values are converted to strings
         return _convert_decimals_to_str(result)
@@ -411,9 +758,28 @@ class AgentSession:
                 for s in version.steps
                 if s.status == StepStatus.COMPLETED
             ],
-            "final_answer": self.state["final_answer"],
-            "confidence": str(self.state["confidence"]),  # Convert Decimal to string
-            "reasoning_note": self.state["reasoning_note"]
+            "final_answer": self.state.final_answer,
+            "confidence": str(self.state.confidence),  # Convert Decimal to string
+            "reasoning_note": self.state.reasoning_note,
+            "original_goal_achieved": self.state.original_goal_achieved,
+            "solution_summary": self.state.solution_summary,
+            "duration_seconds": (self.completed_at - self.created_at).total_seconds() if self.completed_at else None,
+            "total_plan_versions": len(self.plan_versions),
+            "total_events": len(self._event_log)
+        }
+    
+    def get_execution_summary(self) -> Dict[str, Any]:
+        """Get execution summary with metrics."""
+        all_steps = self.get_all_steps()
+        return {
+            "total_steps": len(all_steps),
+            "completed_steps": len([s for s in all_steps if s.status == StepStatus.COMPLETED]),
+            "failed_steps": len([s for s in all_steps if s.status == StepStatus.FAILED]),
+            "pending_steps": len([s for s in all_steps if s.status == StepStatus.PENDING]),
+            "plan_versions": len(self.plan_versions),
+            "replan_count": len([s for s in all_steps if s.was_replanned]),
+            "total_attempts": sum(s.attempts for s in all_steps),
+            "duration_seconds": (self.completed_at - self.created_at).total_seconds() if self.completed_at else None
         }
 
     def mark_complete(
@@ -422,17 +788,35 @@ class AgentSession:
         final_answer: Optional[str] = None,
         fallback_confidence: Optional[Decimal] = None
     ) -> None:
-        """Mark session as complete with perception and final answer."""
-        if fallback_confidence is None:
-            fallback_confidence = Decimal("0.95")
+        """Mark session as complete with perception and final answer (immutable state update)."""
+        # Validation
+        if not isinstance(perception, PerceptionSnapshot):
+            raise TypeError(f"perception must be PerceptionSnapshot, got {type(perception)}")
         
-        self.state.update({
-            "original_goal_achieved": perception.original_goal_achieved,
+        old_state = self.state
+        self.state = self.state.update_with_perception(perception, final_answer)
+        self.completed_at = datetime.now()
+        
+        # Transition to completed state (from EXECUTING or PLANNING)
+        current_state = self._lifecycle_machine.current_state.value
+        if current_state in ("executing", "planning"):
+            self.transition_lifecycle_state("COMPLETED", {
+                "final_answer": final_answer or perception.solution_summary,
+                "confidence": str(self.state.confidence),
+                "original_goal_achieved": self.state.original_goal_achieved,
+                "duration_seconds": (self.completed_at - self.created_at).total_seconds() if self.completed_at else None
+            })
+        # If already in COMPLETED or other terminal state, skip transition
+        
+        self._log_event("session_completed", {
             "final_answer": final_answer or perception.solution_summary,
-            "confidence": perception.confidence if perception.confidence > Decimal("0.0") else fallback_confidence,
-            "reasoning_note": perception.reasoning,
-            "solution_summary": perception.solution_summary
+            "confidence": str(self.state.confidence),
+            "original_goal_achieved": self.state.original_goal_achieved,
+            "duration_seconds": (self.completed_at - self.created_at).total_seconds() if self.completed_at else None
         })
+        
+        # Notify observers of state change
+        self._notify_state_change(old_state, self.state)
 
 
 

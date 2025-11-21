@@ -61,7 +61,8 @@ class Perception:
         raw_input: str, 
         memory: List[Dict[str, Any]], 
         current_plan: str = "", 
-        snapshot_type: str = "user_query"
+        snapshot_type: str = "user_query",
+        current_step_tool_summary: Optional[str] = None
     ) -> dict:
         """
         Build perception input dictionary.
@@ -87,7 +88,7 @@ class Perception:
         else:
             memory_excerpt = {}
 
-        return {
+        perception_input = {
             "run_id": str(uuid.uuid4()),
             "snapshot_type": snapshot_type,
             "raw_input": raw_input,
@@ -98,6 +99,12 @@ class Perception:
             "schema_version": 1,
             "current_plan": current_plan or "Initial Query Mode, plan not created"
         }
+        
+        # Add current step tool summary if provided (overrides LLM inference)
+        if current_step_tool_summary:
+            perception_input["current_step_tool_summary"] = current_step_tool_summary
+        
+        return perception_input
     
     def run(self, perception_input: dict) -> dict:
         """
@@ -110,6 +117,18 @@ class Perception:
             Perception result dictionary
         """
         prompt_template = Path(self.perception_prompt_path).read_text(encoding="utf-8")
+        
+        # Extract current_step_tool_summary if provided
+        current_step_tool_summary = perception_input.pop("current_step_tool_summary", None)
+        
+        # Store it temporarily so _parse_response can access it
+        self._current_step_tool_summary = current_step_tool_summary
+        
+        # If current_step_tool_summary is provided, add explicit instruction
+        if current_step_tool_summary:
+            tool_instruction = f"\n\n⚠️ CRITICAL INSTRUCTION: The 'last_tooluse_summary' field MUST be set to exactly: \"{current_step_tool_summary}\". Do NOT infer from memory or previous steps. Use this exact value."
+            prompt_template = prompt_template + tool_instruction
+        
         full_prompt = f"{prompt_template.strip()}\n\n```json\n{json.dumps(perception_input, indent=2)}\n```"
 
         # Retry logic with exponential backoff
@@ -118,7 +137,7 @@ class Perception:
             try:
                 response = self._call_llm_with_timeout(full_prompt)
                 raw_text = self._extract_response_text(response)
-                return self._parse_response(raw_text)
+                return self._parse_response(raw_text, current_step_tool_summary)
                 
             except (ServerError, APIError) as e:
                 last_exception = e
@@ -212,12 +231,13 @@ class Perception:
         except (AttributeError, IndexError, KeyError) as e:
             raise ValueError(f"Unable to extract text from response: {e}")
 
-    def _parse_response(self, raw_text: str) -> dict:
+    def _parse_response(self, raw_text: str, current_step_tool_summary: Optional[str] = None) -> dict:
         """
         Parse LLM response with multiple fallback strategies.
         
         Args:
             raw_text: Raw text from LLM
+            current_step_tool_summary: Optional tool summary to override LLM inference
             
         Returns:
             Parsed perception result dictionary
@@ -228,18 +248,21 @@ class Perception:
         if json_block:
             try:
                 output = json.loads(json_block)
-                return self._validate_and_normalize_output(output)
+                return self._validate_and_normalize_output(output, current_step_tool_summary)
             except json.JSONDecodeError as e:
                 print(f"⚠️ JSON decode failed: {e}")
                 # Try to salvage partial JSON
-                return self._salvage_partial_json(json_block)
+                salvaged = self._salvage_partial_json(json_block)
+                if current_step_tool_summary:
+                    salvaged["last_tooluse_summary"] = current_step_tool_summary
+                return salvaged
         
         # Strategy 2: Try to find JSON anywhere in text
         json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', raw_text, re.DOTALL)
         if json_match:
             try:
                 output = json.loads(json_match.group(0))
-                return self._validate_and_normalize_output(output)
+                return self._validate_and_normalize_output(output, current_step_tool_summary)
             except json.JSONDecodeError:
                 pass
         
@@ -304,9 +327,10 @@ class Perception:
         
         return salvaged
 
-    def _validate_and_normalize_output(self, output: dict) -> dict:
+    def _validate_and_normalize_output(self, output: dict, current_step_tool_summary: Optional[str] = None) -> dict:
         """Validate and normalize perception output."""
         # Ensure required fields with defaults
+        default_tool_summary = current_step_tool_summary or "None"
         required_fields = {
             "entities": [],
             "result_requirement": "No requirement specified.",
@@ -314,13 +338,17 @@ class Perception:
             "reasoning": "No reasoning given.",
             "local_goal_achieved": False,
             "local_reasoning": "No local reasoning given.",
-            "last_tooluse_summary": "None",
+            "last_tooluse_summary": default_tool_summary,
             "solution_summary": "No summary.",
             "confidence": "0.0"
         }
         
         for key, default in required_fields.items():
             output.setdefault(key, default)
+        
+        # Override last_tooluse_summary if explicitly provided (ensures it's used even if LLM ignored instruction)
+        if current_step_tool_summary:
+            output["last_tooluse_summary"] = current_step_tool_summary
         
         # Ensure entities is a list
         if not isinstance(output["entities"], list):

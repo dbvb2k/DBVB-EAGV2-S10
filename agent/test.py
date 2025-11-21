@@ -98,12 +98,14 @@ step3 = Step(
 steps_v4.append(step3)
 session.add_plan_version(plan_text_v4, steps_v4)
 
-# Final session state
-session.state.update({
-    "goal_satisfied": True,
+# Final session state - Note: SessionState is now immutable, so we update using model_copy
+from decimal import Decimal
+session.state = session.state.model_copy(update={
+    "original_goal_achieved": True,
     "final_answer": "DLF Camelia has 3BHK, 4BHK, and 5BHK variants available.",
-    "confidence": 0.95,
-    "reasoning_note": "Used fallback after two RAG failures. Result successful."
+    "confidence": Decimal("0.95"),
+    "reasoning_note": "Used fallback after two RAG failures. Result successful.",
+    "solution_summary": "DLF Camelia has 3BHK, 4BHK, and 5BHK variants available."
 })
 
 # Simulate

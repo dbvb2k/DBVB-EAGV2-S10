@@ -24,6 +24,7 @@ You will be provided with:
 - The current objective
 - A few completed prior steps (for context only)
 - Memory log of past step failures if memory.
+- current_step_tool_summary (if provided): The exact tool use summary for the CURRENT step - use this value for "last_tooluse_summary" instead of inferring from memory.
 
 Your job is to:
 - Determine what entities were extracted or learned
@@ -47,7 +48,7 @@ Return your result in the following structured format:
   "reasoning": "...",              // A global explanation: Does this result move the agent closer to solving the user query? Why or why not?
   "local_goal_achieved": false,    // true if this step *locally* succeeded (e.g., extracted useful data) and will help achieve final goal, even if the final goal isn't met yet
   "local_reasoning": "..."         // A focused explanation of what this step contributed: was it a valid lookup, good chunk match, or meaningful transform or whether previous tool failed and why?
-  "last_tooluse_summary: "..."     // ToolName and whether success or failure reason.
+  "last_tooluse_summary": "..."     // ToolName and whether success or failure reason. IMPORTANT: If "current_step_tool_summary" is provided in the input, use that exact value. Otherwise, infer from the step result and memory.
   "solution_summary": "..."        // Your user friendly and readable summary of the solution only if "original_goal_achieved" is True, else "Not ready yet".
 }
 

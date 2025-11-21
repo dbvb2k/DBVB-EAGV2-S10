@@ -41,8 +41,10 @@ async def interactive() -> None:
 
         response = await loop.run(query)
         # response = await loop.run("What is 4 + 4?")
-        # pprint(f"🔵  Agent: {response.state['final_answer']}\n {response.state['reasoning_note']}\n")
-        print(f"🔵 Agent: {response.state['solution_summary']}\n")
+        # pprint(f"🔵  Agent: {response.state.final_answer}\n {response.state.reasoning_note}\n")
+        # Use attribute access since state is now a SessionState Pydantic model
+        solution = response.state.solution_summary or response.state.final_answer or "No solution provided"
+        print(f"🔵 Agent: {solution}\n")
 
         follow = input("\n\nContinue? (press Enter) or type 'exit': ").strip()
         if follow.lower() in {"exit", "quit"}:
