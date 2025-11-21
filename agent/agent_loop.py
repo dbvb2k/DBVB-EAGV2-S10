@@ -456,10 +456,18 @@ class AgentLoop:
             return None
         
         elif step.perception.local_goal_achieved:
+            # Check if we have a good solution summary that might indicate goal achievement
+            solution_summary = step.perception.solution_summary or ""
+            has_good_summary = (
+                solution_summary 
+                and solution_summary.lower() not in ("not ready yet", "no summary", "")
+                and len(solution_summary.strip()) > 20  # Has substantial content
+            )
+            
             # Proceed to next step
             next_step = self.get_next_step(session, query, step)
             
-            # If no more steps in plan but goal not achieved, extend the plan
+            # If no more steps in plan but goal not achieved
             if next_step is None:
                 # Check if goal is achieved
                 if step.perception.original_goal_achieved:
@@ -469,16 +477,41 @@ class AgentLoop:
                     await live_update_session_async(session)
                     return None
                 else:
-                    # Goal not achieved and no more steps - extend the plan
+                    # Goal not achieved and no more steps
+                    # If we have a good summary, create a CONCLUDE step instead of extending
+                    if has_good_summary:
+                        print(f"\n💡 Good summary available. Creating CONCLUDE step...")
+                        print(f"   Summary: {solution_summary[:100]}...")
+                        conclude_step = self._create_conclude_step(session, query, step, solution_summary)
+                        if conclude_step:
+                            print(f"   ✅ CONCLUDE step created.")
+                            return conclude_step
+                    
+                    # Otherwise, extend the plan
                     print(f"\n📋 No more steps in current plan, but goal not yet achieved.")
                     print(f"   Current goal status: original_goal_achieved={step.perception.original_goal_achieved}")
                     print(f"   Extending plan with additional steps...")
                     extended_step = self._replan(session, query, step, reason="Extending plan - goal not yet achieved")
                     if extended_step:
-                        print(f"   ✅ Plan extended. New step {extended_step.index} created.")
+                        # Validate the extended step before using it
+                        if extended_step.description and extended_step.description != "Missing from LLM response":
+                            print(f"   ✅ Plan extended. New step {extended_step.index} created.")
+                            return extended_step
+                        else:
+                            print(f"   ⚠️ Invalid step from decision module: '{extended_step.description}'")
+                            # Try to conclude with summary if available
+                            if has_good_summary:
+                                print(f"   Attempting to conclude with available summary...")
+                                return self._create_conclude_step(session, query, step, solution_summary)
+                            else:
+                                print(f"   ❌ Failed to extend plan and no summary available.")
+                                return None
                     else:
                         print(f"   ⚠️ Failed to extend plan.")
-                    return extended_step
+                        # Try to conclude with summary if available
+                        if has_good_summary:
+                            return self._create_conclude_step(session, query, step, solution_summary)
+                        return None
             
             return next_step
         else:
@@ -537,6 +570,46 @@ class AgentLoop:
             print("\n✅ No more steps in current plan.")
             return None
 
+    def _create_conclude_step(
+        self,
+        session: AgentSession,
+        query: str,
+        step: Step,
+        summary: str
+    ) -> Optional[Step]:
+        """Create a CONCLUDE step with the provided summary."""
+        from agent.step_builder import StepBuilder
+        from agent.agentSession import StepType
+        
+        # Determine the next step index
+        next_index = step.index + 1
+        if session.plan_versions:
+            current_plan = session.plan_versions[-1]
+            # Use the next index after all current plan steps
+            next_index = len(current_plan.plan_text)
+        
+        # Create CONCLUDE step with summary
+        conclude_step = (StepBuilder()
+            .with_index(next_index)
+            .with_description("Provide final answer based on the summary")
+            .with_type(StepType.CONCLUDE)
+            .with_conclusion(summary)
+            .build())
+        
+        # Add plan version with CONCLUDE step
+        plan_texts = []
+        if session.plan_versions:
+            plan_texts = session.plan_versions[-1].plan_text.copy()
+        plan_texts.append(f"Step {next_index}: Provide final answer based on summary.")
+        
+        new_step = session.add_plan_version(
+            plan_texts,
+            [conclude_step],
+            reason="Concluding with available summary"
+        )
+        self.print_plan_version(session, len(session.plan_versions))
+        return new_step
+    
     def _replan(
         self, 
         session: AgentSession, 
@@ -578,13 +651,40 @@ class AgentLoop:
             "reason": reason or "Replanning"
         })
         
-        new_step = session.add_plan_version(
-            decision_output["plan_text"],
-            [self.create_step(decision_output)],
-            reason=reason or f"Replanned after step {step.index} failure"
-        )
-        self.print_plan_version(session, len(session.plan_versions))
-        return new_step
+        # Create step and validate it
+        try:
+            created_step = self.create_step(decision_output)
+            
+            # Validate the created step
+            if not created_step.description or created_step.description == "Missing from LLM response":
+                print(f"⚠️ Invalid step description from decision module: '{created_step.description}'")
+                # Try to create a default valid step based on the last step's result
+                if step.perception and step.perception.solution_summary:
+                    solution_summary = step.perception.solution_summary
+                    if solution_summary and solution_summary.lower() not in ("not ready yet", "no summary", ""):
+                        print(f"   Attempting to create CONCLUDE step with available summary...")
+                        return self._create_conclude_step(session, query, step, solution_summary)
+                
+                # If no summary, return None to signal failure
+                print(f"   ❌ Cannot create valid step from decision output.")
+                return None
+            
+            new_step = session.add_plan_version(
+                decision_output["plan_text"],
+                [created_step],
+                reason=reason or f"Replanned after step {step.index} failure"
+            )
+            self.print_plan_version(session, len(session.plan_versions))
+            return new_step
+        except Exception as e:
+            print(f"❌ Error creating step from decision output: {e}")
+            # Try to conclude with summary if available
+            if step.perception and step.perception.solution_summary:
+                solution_summary = step.perception.solution_summary
+                if solution_summary and solution_summary.lower() not in ("not ready yet", "no summary", ""):
+                    print(f"   Attempting to conclude with available summary...")
+                    return self._create_conclude_step(session, query, step, solution_summary)
+            return None
 
     def print_plan_version(self, session: AgentSession, version_num: int) -> None:
         """Print the current plan version."""
